@@ -1,0 +1,89 @@
+name: Deploy to Alibaba Cloud ECS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  DOCKER_IMAGE: math-notes-api
+  CONTAINER_NAME: math-notes-api
+  ECS_HOST: ${{ secrets.ECS_HOST }}
+  ECS_USER: ${{ secrets.ECS_USER }}
+  ECS_PORT: ${{ secrets.ECS_PORT || '22' }}
+  APP_DIR: /opt/math-notes-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} .
+          docker tag ${{ env.DOCKER_IMAGE }}:${{ github.sha }} ${{ env.DOCKER_IMAGE }}:latest
+
+      - name: Deploy to ECS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECS_HOST }}
+          username: ${{ env.ECS_USER }}
+          port: ${{ env.ECS_PORT }}
+          key: ${{ secrets.ECS_SSH_KEY }}
+          script: |
+            cd ${{ env.APP_DIR }}
+            
+            # Pull latest code
+            git pull origin main || git pull origin master
+            
+            # Build Docker image on server
+            docker build -t ${{ env.DOCKER_IMAGE }}:latest .
+            
+            # Stop and remove old container
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+            
+            # Run new container
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e NODE_ENV=production \
+              -e PORT=3000 \
+              -e DASHSCOPE_API_KEY="${{ secrets.DASHSCOPE_API_KEY }}" \
+              -e DASHSCOPE_BASE_URL="${{ secrets.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1' }}" \
+              -e VISION_MODEL="${{ secrets.VISION_MODEL || 'qwen3-vl-plus' }}" \
+              -e CORS_ORIGINS="${{ secrets.CORS_ORIGINS || '*' }}" \
+              ${{ env.DOCKER_IMAGE }}:latest
+            
+            # Wait for health check
+            sleep 5
+            docker ps -f name=${{ env.CONTAINER_NAME }}
+            
+      - name: Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECS_HOST }}
+          username: ${{ env.ECS_USER }}
+          port: ${{ env.ECS_PORT }}
+          key: ${{ secrets.ECS_SSH_KEY }}
+          script: |
+            curl -f http://localhost:3000/health || exit 1
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment successful!"
+          
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
